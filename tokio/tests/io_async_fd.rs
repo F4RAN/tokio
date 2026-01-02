@@ -1047,3 +1047,57 @@ async fn memory_leak_rss_check() {
          Expected memory to stabilize (at least one phase with <256KB growth).",
     );
 }
+
+/// Miri test for issue #7563 - Memory leak when fd closed before AsyncFd drop
+///
+/// This test checks if Miri can detect the logical leak where ScheduledIo
+/// objects remain in the registration list when fd is closed before drop.
+///
+/// Run with: MIRIFLAGS="-Zmiri-disable-isolation" cargo miri test --features full --test io_async_fd memory_leak_miri
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn memory_leak_miri_check() {
+    use std::os::unix::io::{AsRawFd, RawFd};
+    use std::sync::Arc;
+    use tokio::io::unix::AsyncFd;
+
+    use nix::sys::socket::{self, AddressFamily, SockFlag, SockType};
+
+    struct RawFdWrapper {
+        fd: RawFd,
+    }
+
+    impl AsRawFd for RawFdWrapper {
+        fn as_raw_fd(&self) -> RawFd {
+            self.fd
+        }
+    }
+
+    // Run fewer iterations for Miri (it's slow)
+    // If there's a leak, Miri should report it at test end
+    for _ in 0..50 {
+        let (fd_a, _fd_b) = socket::socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::empty(),
+        )
+        .unwrap();
+
+        let raw_fd = fd_a.as_raw_fd();
+        set_nonblocking(raw_fd);
+        std::mem::forget(fd_a);
+
+        let wrapper = Arc::new(RawFdWrapper { fd: raw_fd });
+        let async_fd = AsyncFd::new(ArcFd(wrapper)).unwrap();
+
+        // Close fd before dropping AsyncFd - this triggers the bug
+        unsafe {
+            libc::close(raw_fd);
+        }
+
+        drop(async_fd);
+    }
+
+    // If Miri detects leaked memory, it will report at test exit
+}
